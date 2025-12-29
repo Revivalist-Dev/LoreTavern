@@ -1792,6 +1792,35 @@ function getChutesModelTemplate(option) {
     `));
 }
 
+function getNanoGptModelTemplate(option) {
+    const model = model_list.find(x => x.id === option?.element?.value);
+
+    if (!option.id || !model) {
+        return option.text;
+    }
+
+    const inputPrice = model.pricing?.prompt;
+    const outputPrice = model.pricing?.completion;
+
+    let price = 'Unknown';
+    if (inputPrice !== undefined && outputPrice !== undefined) {
+        // Check if both prices are 0 (free model)
+        if (inputPrice === 0 && outputPrice === 0) {
+            price = 'Free';
+        } else {
+            price = `$${Math.round(inputPrice * 100) / 100}/$${Math.round(outputPrice * 100) / 100} in/out Mtoken`;
+        }
+    }
+
+    const contextLength = model.context_length || 'Unknown';
+
+    return $((`
+        <div class="flex-container alignItemsBaseline" title="${DOMPurify.sanitize(model.id)}">
+            <strong>${DOMPurify.sanitize(model.id)}</strong> | ${contextLength} ctx | <small>${price}</small>
+        </div>
+    `));
+}
+
 function calculateChutesCost() {
     if (oai_settings.chat_completion_source !== chat_completion_sources.CHUTES) {
         return;
@@ -1917,7 +1946,7 @@ function saveModelList(data) {
     }
 
     if (oai_settings.chat_completion_source == chat_completion_sources.CHUTES) {
-        model_list = model_list.filter(model => !model.id.toLowerCase().includes('affine'));
+        model_list = model_list.filter(model => typeof model.id === 'string' && !model.id.toLowerCase().includes('affine'));
 
         model_list = chutesSortBy(model_list, oai_settings.chutes_sort_models);
 
@@ -2713,7 +2742,8 @@ export async function createGenerationParameters(settings, model, type, messages
         generate_data['seed'] = settings.seed;
     }
 
-    if (gptSources.includes(settings.chat_completion_source) && /^(o1|o3|o4)/.test(model)) {
+    if ([chat_completion_sources.OPENAI, chat_completion_sources.AZURE_OPENAI].includes(settings.chat_completion_source) && /^(o1|o3|o4)/.test(model) ||
+        (chat_completion_sources.OPENROUTER === settings.chat_completion_source && /^openai\/(o1|o3|o4)/.test(model))) {
         generate_data.max_completion_tokens = generate_data.max_tokens;
         delete generate_data.max_tokens;
         delete generate_data.logprobs;
@@ -2724,7 +2754,7 @@ export async function createGenerationParameters(settings, model, type, messages
         delete generate_data.top_p;
         delete generate_data.frequency_penalty;
         delete generate_data.presence_penalty;
-        if (model.startsWith('o1')) {
+        if (/^(openai\/)?(o1)/.test(model)) {
             generate_data.messages.forEach((msg) => {
                 if (msg.role === 'system') {
                     msg.role = 'user';
@@ -2736,7 +2766,7 @@ export async function createGenerationParameters(settings, model, type, messages
         }
     }
 
-    if (gptSources.includes(settings.chat_completion_source) && /^gpt-5/.test(model)) {
+    if (gptSources.includes(settings.chat_completion_source) && /gpt-5/.test(model)) {
         generate_data.max_completion_tokens = generate_data.max_tokens;
         delete generate_data.max_tokens;
         delete generate_data.logprobs;
@@ -4769,13 +4799,16 @@ function getZaiMaxContext(model, isUnlocked) {
     }
 
     const contextMap = {
+        'glm-4.7': max_200k,
         'glm-4.6v': max_128k,
         'glm-4.6v-flash': max_128k,
+        'glm-4.6v-flashx': max_128k,
         'glm-4.6': max_200k,
         'glm-4.5': max_128k,
         'glm-4-32b-0414-128k': max_128k,
         'glm-4.5-air': max_128k,
         'glm-4.5v': max_64k,
+        'autoglm-phone-multilingual': max_64k,
     };
 
     // Return context size if model found, otherwise default to 128k
@@ -5798,6 +5831,7 @@ export function isImageInliningSupported() {
         // Z.AI (GLM)
         'glm-4.5v',
         'glm-4.6v',
+        'autoglm-phone',
         // SiliconFlow
         'Qwen/Qwen3-VL-32B-Instruct',
         'Qwen/Qwen3-VL-8B-Instruct',
@@ -6705,6 +6739,14 @@ export function initOpenAI() {
             searchInputCssClass: 'text_pole',
             width: '100%',
             templateResult: getChutesModelTemplate,
+            matcher: textValueMatcher,
+        });
+        $('#model_nanogpt_select').select2({
+            placeholder: t`Select a model`,
+            searchInputPlaceholder: t`Search models...`,
+            searchInputCssClass: 'text_pole',
+            width: '100%',
+            templateResult: getNanoGptModelTemplate,
             matcher: textValueMatcher,
         });
         $('#completion_prompt_manager_popup_entry_form_injection_trigger').select2({
