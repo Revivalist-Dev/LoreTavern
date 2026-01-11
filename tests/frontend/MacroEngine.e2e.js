@@ -633,28 +633,69 @@ test.describe('MacroEngine', () => {
     });
 
     test.describe('Deterministic pick macro', () => {
-        test('should return stable results for the same chat and content', async ({ page }) => {
-            // Simulate a consistent chat id hash
-            let originalHash;
-            await page.evaluate(async ([originalHash]) => {
+        /** Fixed chat ID hash used across all pick tests for deterministic behavior */
+        const TEST_CHAT_ID_HASH = 123456;
+
+        /**
+         * Registers a testable pick macro that returns the seed string instead of the picked value.
+         * This allows tests to verify that different macro positions produce different seeds.
+         *
+         * @param {import('@playwright/test').Page} page
+         */
+        async function registerTestablePick(page) {
+            await page.evaluate(async () => {
+                /** @type {import('../../public/scripts/macros/engine/MacroRegistry.js')} */
+                const { MacroRegistry, MacroCategory } = await import('./scripts/macros/engine/MacroRegistry.js');
+                /** @type {import('../../public/scripts/utils.js')} */
+                const { getStringHash } = await import('./scripts/utils.js');
                 /** @type {import('../../public/script.js')} */
                 const { chat_metadata } = await import('./script.js');
-                originalHash = chat_metadata['chat_id_hash'];
-                chat_metadata['chat_id_hash'] = 123456;
-            }, [originalHash]);
+                /** @type {import('../../public/lib.js')} */
+                const { seedrandom } = await import('./lib.js');
 
+                // Only register once
+                if (MacroRegistry.getMacro('testablePick')) return;
+
+                MacroRegistry.registerMacro('testablePick', {
+                    category: MacroCategory.RANDOM,
+                    list: true,
+                    description: 'Test version of pick that returns the seed string for verification.',
+                    handler: ({ list, globalOffset, env }) => {
+                        const chatIdHash = chat_metadata.chat_id_hash ?? 0;
+                        const rawContentHash = env.contentHash;
+                        const offset = globalOffset;
+                        const combinedSeedString = `${chatIdHash}-${rawContentHash}-${offset}`;
+                        // Return both the seed and what would be picked for validation
+                        const finalSeed = getStringHash(combinedSeedString);
+                        const rng = seedrandom(String(finalSeed));
+                        const randomIndex = Math.floor(rng() * list.length);
+                        return `seed:${combinedSeedString}|pick:${list[randomIndex]}`;
+                    },
+                });
+            });
+        }
+
+        test.beforeEach(async ({ page }) => {
+            // Set consistent chat ID hash for all tests
+            await page.evaluate(async (hash) => {
+                /** @type {import('../../public/script.js')} */
+                const { chat_metadata } = await import('./script.js');
+                chat_metadata.chat_id_hash = hash;
+            }, TEST_CHAT_ID_HASH);
+        });
+
+        test('should return stable results for the same chat and content', async ({ page }) => {
             const input = 'Choices: {{pick::red::green::blue}}, {{pick::red::green::blue}}.';
 
             const output1 = await evaluateWithEngine(page, input);
             const output2 = await evaluateWithEngine(page, input);
 
-            // Deterministic: same chat and same content should yield identical output.
+            // Deterministic: same chat and same content should yield identical output
             expect(output1).toBe(output2);
 
-            // Sanity check: both picks should resolve to one of the provided options.
+            // Sanity check: both picks should resolve to one of the provided options
             const match = output1.match(/Choices: ([^,]+), ([^.]+)\./);
             expect(match).not.toBeNull();
-
             if (!match) return;
 
             const first = match[1].trim();
@@ -663,51 +704,665 @@ test.describe('MacroEngine', () => {
 
             expect(options.includes(first)).toBeTruthy();
             expect(options.includes(second)).toBeTruthy();
-
-            // Restore original hash
-            await page.evaluate(async ([originalHash]) => {
-                /** @type {import('../../public/script.js')} */
-                const { chat_metadata } = await import('./script.js');
-                chat_metadata['chat_id_hash'] = originalHash;
-            }, [originalHash]);
         });
-    });
 
-    test.describe('Dynamic macros', () => {
-        test('should not resolve dynamic macro when called with arguments due to strict arity', async ({ page }) => {
-            /** @type {string[]} */
-            const warnings = [];
-            page.on('console', msg => {
-                if (msg.type() === 'warning') {
-                    warnings.push(msg.text());
-                }
-            });
+        test('should use different seeds for identical picks at different positions', async ({ page }) => {
+            await registerTestablePick(page);
 
-            const input = 'Dyn: {{dyn::extra}}';
-            const output = await page.evaluate(async (input) => {
+            const output = await page.evaluate(async () => {
                 /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
                 const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
                 /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
                 const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
 
-                /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js').MacroEnvRawContext} */
-                const rawEnv = {
-                    content: input,
-                    dynamicMacros: {
-                        dyn: () => 'OK',
-                    },
-                };
-                const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
-
+                const input = '{{testablePick::A::B::C}}###{{testablePick::A::B::C}}';
+                const env = MacroEnvBuilder.buildFromRawEnv({ content: input });
                 return MacroEngine.evaluate(input, env);
-            }, input);
+            });
 
-            // Dynamic macro with arguments should not resolve because the
-            // temporary definition is strictArgs: true and minArgs/maxArgs: 0.
-            expect(output).toBe(input);
+            const parts = output.split('###');
+            expect(parts.length).toBe(2);
 
-            // A runtime arity warning for the dynamic macro should be logged
-            expect(warnings.some(w => w.includes('Macro "dyn"') && w.includes('unnamed arguments'))).toBeTruthy();
+            // Extract seeds from both results
+            const seed1 = parts[0].match(/seed:([^|]+)/)?.[1];
+            const seed2 = parts[1].match(/seed:([^|]+)/)?.[1];
+
+            expect(seed1).toBeTruthy();
+            expect(seed2).toBeTruthy();
+            // Seeds must be different because the macros are at different positions
+            expect(seed1).not.toBe(seed2);
+
+            // Verify picked values are valid options
+            const pick1 = parts[0].match(/pick:(\w+)/)?.[1];
+            const pick2 = parts[1].match(/pick:(\w+)/)?.[1];
+            const options = ['A', 'B', 'C'];
+            expect(options.includes(pick1 ?? '')).toBeTruthy();
+            expect(options.includes(pick2 ?? '')).toBeTruthy();
+        });
+
+        test('should use different seeds for identical picks inside different scoped macros at the same offset', async ({ page }) => {
+            await registerTestablePick(page);
+
+            // Key regression test: picks inside scoped content must use global offsets
+            const output = await page.evaluate(async () => {
+                /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                // Two identical pick macros inside different setvar scopes
+                // Before the fix, both would get startOffset=0 relative to their argument
+                // After the fix, they get different globalOffset values
+                const input = '{{setvar::first}}{{testablePick::A::B::C}}{{/setvar}}{{setvar::second}}{{testablePick::A::B::C}}{{/setvar}}{{.first}}###{{.second}}';
+                const env = MacroEnvBuilder.buildFromRawEnv({ content: input });
+                return MacroEngine.evaluate(input, env);
+            });
+
+            const parts = output.split('###');
+            expect(parts.length).toBe(2);
+
+            const seed1 = parts[0].match(/seed:([^|]+)/)?.[1];
+            const seed2 = parts[1].match(/seed:([^|]+)/)?.[1];
+
+            expect(seed1).toBeTruthy();
+            expect(seed2).toBeTruthy();
+            // Seeds must be different - this is the key assertion for the fix
+            expect(seed1).not.toBe(seed2);
+        });
+
+        test('should use different seeds for identical picks in inline arguments', async ({ page }) => {
+            await registerTestablePick(page);
+
+            const output = await page.evaluate(async () => {
+                /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                // Two identical pick macros inside different setvar inline arguments
+                const input = '{{setvar::first::{{testablePick::A::B::C}}}}{{setvar::second::{{testablePick::A::B::C}}}}{{.first}}###{{.second}}';
+                const env = MacroEnvBuilder.buildFromRawEnv({ content: input });
+                return MacroEngine.evaluate(input, env);
+            });
+
+            const parts = output.split('###');
+            expect(parts.length).toBe(2);
+
+            const seed1 = parts[0].match(/seed:([^|]+)/)?.[1];
+            const seed2 = parts[1].match(/seed:([^|]+)/)?.[1];
+
+            expect(seed1).toBeTruthy();
+            expect(seed2).toBeTruthy();
+            // Seeds must be different due to different global offsets
+            expect(seed1).not.toBe(seed2);
+        });
+
+        test('should maintain stability across evaluations for picks in scoped content', async ({ page }) => {
+            // Picks inside scoped content should still be deterministic (same result each time)
+            const outputs = await page.evaluate(async () => {
+                /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                const input = '{{setvar::val}}{{pick::X::Y::Z}}{{/setvar}}{{.val}}';
+                const env1 = MacroEnvBuilder.buildFromRawEnv({ content: input });
+                const env2 = MacroEnvBuilder.buildFromRawEnv({ content: input });
+                const result1 = MacroEngine.evaluate(input, env1);
+                const result2 = MacroEngine.evaluate(input, env2);
+                return [result1, result2];
+            });
+
+            // Same input should produce same output (deterministic)
+            expect(outputs[0]).toBe(outputs[1]);
+            // Should be one of the valid options
+            expect(['X', 'Y', 'Z'].includes(outputs[0])).toBeTruthy();
+        });
+
+        test('should use different seeds for identical picks inside different if blocks (delayArgResolution)', async ({ page }) => {
+            await registerTestablePick(page);
+
+            // Key regression test: picks inside {{if}} blocks use resolve() which must preserve globalOffset
+            // This tests the fix for macros with delayArgResolution that call resolve() internally
+            const output = await page.evaluate(async () => {
+                /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                // Two identical pick macros inside different if blocks
+                // Before the fix, both would get contextOffset=0 when resolve() was called
+                // After the fix, resolve() passes the caller's globalOffset as contextOffset
+                const input = '{{if true}}{{testablePick::A::B::C}}{{/if}}###{{if true}}{{testablePick::A::B::C}}{{/if}}';
+                const env = MacroEnvBuilder.buildFromRawEnv({ content: input });
+                return MacroEngine.evaluate(input, env);
+            });
+
+            const parts = output.split('###');
+            expect(parts.length).toBe(2);
+
+            const seed1 = parts[0].match(/seed:([^|]+)/)?.[1];
+            const seed2 = parts[1].match(/seed:([^|]+)/)?.[1];
+
+            expect(seed1).toBeTruthy();
+            expect(seed2).toBeTruthy();
+            // Seeds must be different because the {{if}} blocks are at different positions
+            expect(seed1).not.toBe(seed2);
+        });
+
+        test('should maintain stability for picks inside if blocks across evaluations', async ({ page }) => {
+            // Picks inside if blocks should still be deterministic
+            const outputs = await page.evaluate(async () => {
+                /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                const input = '{{if true}}{{pick::X::Y::Z}}{{/if}}';
+                const env1 = MacroEnvBuilder.buildFromRawEnv({ content: input });
+                const env2 = MacroEnvBuilder.buildFromRawEnv({ content: input });
+                const result1 = MacroEngine.evaluate(input, env1);
+                const result2 = MacroEngine.evaluate(input, env2);
+                return [result1, result2];
+            });
+
+            // Same input should produce same output (deterministic)
+            expect(outputs[0]).toBe(outputs[1]);
+            // Should be one of the valid options
+            expect(['X', 'Y', 'Z'].includes(outputs[0])).toBeTruthy();
+        });
+    });
+
+    test.describe('Dynamic macros', () => {
+        test.describe('String value dynamic macros', () => {
+            test('should resolve dynamic macro with string value', async ({ page }) => {
+                const output = await page.evaluate(async () => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: 'Test: {{myvalue}}',
+                        dynamicMacros: {
+                            myvalue: 'hello world',
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate('Test: {{myvalue}}', env);
+                });
+
+                expect(output).toBe('Test: hello world');
+            });
+
+            test('should resolve dynamic macro with numeric value converted to string', async ({ page }) => {
+                const output = await page.evaluate(async () => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: '',
+                        dynamicMacros: {
+                            num: 42,
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate('Value: {{num}}', env);
+                });
+
+                expect(output).toBe('Value: 42');
+            });
+
+            test('should not resolve string dynamic macro when called with arguments', async ({ page }) => {
+                const warnings = [];
+                page.on('console', msg => {
+                    if (msg.type() === 'warning') warnings.push(msg.text());
+                });
+
+                const input = 'Dyn: {{myvalue::extra}}';
+                const output = await page.evaluate(async (input) => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: input,
+                        dynamicMacros: { myvalue: 'hello' },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate(input, env);
+                }, input);
+
+                expect(output).toBe(input);
+                expect(warnings.some(w => w.includes('Macro "myvalue"') && w.includes('unnamed arguments'))).toBeTruthy();
+            });
+        });
+
+        test.describe('Handler function dynamic macros', () => {
+            test('should resolve dynamic macro with handler function', async ({ page }) => {
+                const output = await page.evaluate(async () => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: '',
+                        dynamicMacros: {
+                            dyn: () => 'handler result',
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate('Result: {{dyn}}', env);
+                });
+
+                expect(output).toBe('Result: handler result');
+            });
+
+            test('should pass execution context to handler function', async ({ page }) => {
+                const output = await page.evaluate(async () => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: 'full content here',
+                        dynamicMacros: {
+                            dyn: (ctx) => `name=${ctx.name}, content=${ctx.env.content}`,
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate('{{dyn}}', env);
+                });
+
+                expect(output).toBe('name=dyn, content=full content here');
+            });
+
+            test('should not resolve handler dynamic macro when called with arguments due to strict arity', async ({ page }) => {
+                const warnings = [];
+                page.on('console', msg => {
+                    if (msg.type() === 'warning') warnings.push(msg.text());
+                });
+
+                const input = 'Dyn: {{dyn::extra}}';
+                const output = await page.evaluate(async (input) => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: input,
+                        dynamicMacros: {
+                            dyn: () => 'OK',
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate(input, env);
+                }, input);
+
+                expect(output).toBe(input);
+                expect(warnings.some(w => w.includes('Macro "dyn"') && w.includes('unnamed arguments'))).toBeTruthy();
+            });
+        });
+
+        test.describe('MacroDefinitionOptions dynamic macros', () => {
+            test('should resolve dynamic macro with MacroDefinitionOptions', async ({ page }) => {
+                const output = await page.evaluate(async () => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: '',
+                        dynamicMacros: {
+                            greet: {
+                                description: 'A greeting macro',
+                                handler: () => 'Hello from options!',
+                            },
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate('{{greet}}', env);
+                });
+
+                expect(output).toBe('Hello from options!');
+            });
+
+            test('should support unnamed arguments in dynamic macro with options', async ({ page }) => {
+                const output = await page.evaluate(async () => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: '',
+                        dynamicMacros: {
+                            greet: {
+                                unnamedArgs: [{ name: 'name' }],
+                                handler: ({ unnamedArgs: [name] }) => `Hello, ${name}!`,
+                            },
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate('{{greet::World}}', env);
+                });
+
+                expect(output).toBe('Hello, World!');
+            });
+
+            test('should support multiple unnamed arguments in dynamic macro', async ({ page }) => {
+                const output = await page.evaluate(async () => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: '',
+                        dynamicMacros: {
+                            wrap: {
+                                unnamedArgs: [
+                                    { name: 'content' },
+                                    { name: 'prefix' },
+                                    { name: 'suffix' },
+                                ],
+                                handler: ({ unnamedArgs: [content, prefix, suffix] }) => `${prefix}${content}${suffix}`,
+                            },
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate('{{wrap::hello::[::]}}', env);
+                });
+
+                expect(output).toBe('[hello]');
+            });
+
+            test('should support optional arguments in dynamic macro', async ({ page }) => {
+                const output = await page.evaluate(async () => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: '',
+                        dynamicMacros: {
+                            greet: {
+                                unnamedArgs: [
+                                    { name: 'name' },
+                                    { name: 'greeting', optional: true, defaultValue: 'Hello' },
+                                ],
+                                handler: ({ unnamedArgs: [name, greeting] }) => `${greeting || 'Hello'}, ${name}!`,
+                            },
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+
+                    const result1 = MacroEngine.evaluate('{{greet::World}}', env);
+                    const result2 = MacroEngine.evaluate('{{greet::World::Hi}}', env);
+                    return { result1, result2 };
+                });
+
+                expect(output.result1).toBe('Hello, World!');
+                expect(output.result2).toBe('Hi, World!');
+            });
+
+            test('should support list arguments in dynamic macro', async ({ page }) => {
+                const output = await page.evaluate(async () => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: '',
+                        dynamicMacros: {
+                            join: {
+                                unnamedArgs: [{ name: 'separator' }],
+                                list: true,
+                                handler: ({ unnamedArgs: [sep], list }) => list.join(sep),
+                            },
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate('{{join::-::a::b::c}}', env);
+                });
+
+                expect(output).toBe('a-b-c');
+            });
+
+            test('should enforce type validation in dynamic macro with options', async ({ page }) => {
+                const warnings = [];
+                page.on('console', msg => {
+                    if (msg.type() === 'warning') warnings.push(msg.text());
+                });
+
+                const input = '{{calc::abc}}';
+                const output = await page.evaluate(async (input) => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: input,
+                        dynamicMacros: {
+                            calc: {
+                                unnamedArgs: [{ name: 'value', type: 'integer' }],
+                                strictArgs: true,
+                                handler: ({ unnamedArgs: [val] }) => `#${val}#`,
+                            },
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate(input, env);
+                }, input);
+
+                expect(output).toBe(input);
+                expect(warnings.some(w => w.includes('calc') && w.includes('expected type integer'))).toBeTruthy();
+            });
+
+            test('should respect strictArgs: false in dynamic macro with options', async ({ page }) => {
+                const warnings = [];
+                page.on('console', msg => {
+                    if (msg.type() === 'warning') warnings.push(msg.text());
+                });
+
+                const output = await page.evaluate(async () => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: '',
+                        dynamicMacros: {
+                            calc: {
+                                unnamedArgs: [{ name: 'value', type: 'integer' }],
+                                strictArgs: false,
+                                handler: ({ unnamedArgs: [val] }) => `#${val}#`,
+                            },
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate('{{calc::abc}}', env);
+                });
+
+                expect(output).toBe('#abc#');
+                expect(warnings.some(w => w.includes('calc') && w.includes('expected type integer'))).toBeTruthy();
+            });
+
+            test('should fail arity check in dynamic macro with options when too few args', async ({ page }) => {
+                const warnings = [];
+                page.on('console', msg => {
+                    if (msg.type() === 'warning') warnings.push(msg.text());
+                });
+
+                const input = '{{greet}}';
+                const output = await page.evaluate(async (input) => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: input,
+                        dynamicMacros: {
+                            greet: {
+                                unnamedArgs: [{ name: 'name' }],
+                                handler: ({ unnamedArgs: [name] }) => `Hello, ${name}!`,
+                            },
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate(input, env);
+                }, input);
+
+                expect(output).toBe(input);
+                expect(warnings.some(w => w.includes('greet') && w.includes('unnamed arguments'))).toBeTruthy();
+            });
+
+            test('should fail arity check in dynamic macro with options when too many args', async ({ page }) => {
+                const warnings = [];
+                page.on('console', msg => {
+                    if (msg.type() === 'warning') warnings.push(msg.text());
+                });
+
+                const input = '{{greet::one::two}}';
+                const output = await page.evaluate(async (input) => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: input,
+                        dynamicMacros: {
+                            greet: {
+                                unnamedArgs: [{ name: 'name' }],
+                                handler: ({ unnamedArgs: [name] }) => `Hello, ${name}!`,
+                            },
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate(input, env);
+                }, input);
+
+                expect(output).toBe(input);
+                expect(warnings.some(w => w.includes('greet') && w.includes('unnamed arguments'))).toBeTruthy();
+            });
+
+            test('should handle invalid MacroDefinitionOptions gracefully', async ({ page }) => {
+                const warnings = [];
+                page.on('console', msg => {
+                    if (msg.type() === 'warning') warnings.push(msg.text());
+                });
+
+                const input = '{{bad}}';
+                const output = await page.evaluate(async (input) => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js').MacroEnvRawContext} */
+                    const rawEnv = {
+                        content: input,
+                        dynamicMacros: {
+                            bad: {
+                                // Missing handler - should fail validation
+                                unnamedArgs: 1,
+                            },
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate(input, env);
+                }, input);
+
+                // Should remain unresolved since options are invalid
+                expect(output).toBe(input);
+                expect(warnings.some(w => w.includes('bad') && w.includes('is not defined correctly'))).toBeTruthy();
+            });
+        });
+
+        test.describe('Dynamic macro priority and case sensitivity', () => {
+            test('should override registered macro with dynamic macro of same name', async ({ page }) => {
+                const output = await page.evaluate(async () => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: '',
+                        name1Override: 'User',
+                        dynamicMacros: {
+                            user: 'DynamicUser',
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate('{{user}}', env);
+                });
+
+                expect(output).toBe('DynamicUser');
+            });
+
+            test('should match dynamic macro names case-insensitively', async ({ page }) => {
+                const output = await page.evaluate(async () => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: '',
+                        dynamicMacros: {
+                            MyMacro: 'value',
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+
+                    const r1 = MacroEngine.evaluate('{{MyMacro}}', env);
+                    const r2 = MacroEngine.evaluate('{{mymacro}}', env);
+                    const r3 = MacroEngine.evaluate('{{MYMACRO}}', env);
+                    return { r1, r2, r3 };
+                });
+
+                expect(output.r1).toBe('value');
+                expect(output.r2).toBe('value');
+                expect(output.r3).toBe('value');
+            });
+
+            test('should resolve multiple different dynamic macros in same evaluation', async ({ page }) => {
+                const output = await page.evaluate(async () => {
+                    /** @type {import('../../public/scripts/macros/engine/MacroEngine.js')} */
+                    const { MacroEngine } = await import('./scripts/macros/engine/MacroEngine.js');
+                    /** @type {import('../../public/scripts/macros/engine/MacroEnvBuilder.js')} */
+                    const { MacroEnvBuilder } = await import('./scripts/macros/engine/MacroEnvBuilder.js');
+
+                    const rawEnv = {
+                        content: '',
+                        dynamicMacros: {
+                            a: 'alpha',
+                            b: () => 'beta',
+                            c: {
+                                handler: () => 'gamma',
+                            },
+                        },
+                    };
+                    const env = MacroEnvBuilder.buildFromRawEnv(rawEnv);
+                    return MacroEngine.evaluate('{{a}}-{{b}}-{{c}}', env);
+                });
+
+                expect(output).toBe('alpha-beta-gamma');
+            });
         });
     });
 
@@ -1133,6 +1788,61 @@ test.describe('MacroEngine', () => {
             const input = '{{setvar::a}}first{{/setvar}}middle{{setvar::b}}second{{/setvar}}[{{getvar::a}}][{{getvar::b}}]';
             const output = await evaluateWithEngine(page, input);
             expect(output).toBe('middle[first][second]');
+        });
+
+        test.describe('scoped macros nested inside arguments', () => {
+            test('should resolve scoped macro inside another macro argument', async ({ page }) => {
+                // {{reverse}}hello{{/reverse}} inside setvar's value argument should resolve first
+                const input = '{{setvar::testvar::{{reverse}}hello{{/reverse}}}} {{getvar::testvar}}';
+                const output = await evaluateWithEngine(page, input);
+                expect(output).toBe(' olleh');
+            });
+
+            test('should resolve scoped if macro inside setvar argument', async ({ page }) => {
+                // {{if true}}true branch{{/if}} inside setvar should resolve to "true branch"
+                const input = '{{setvar::testvar::{{if true}}true branch{{/if}}}} {{getvar::testvar}}';
+                const output = await evaluateWithEngine(page, input);
+                expect(output).toBe(' true branch');
+            });
+
+            test('should resolve scoped if/else macro inside setvar argument', async ({ page }) => {
+                const input = '{{setvar::testvar::{{if 0}}wrong{{else}}correct{{/if}}}} {{getvar::testvar}}';
+                const output = await evaluateWithEngine(page, input);
+                expect(output).toBe(' correct');
+            });
+
+            test('should resolve multiple scoped macros inside single argument', async ({ page }) => {
+                // Two scoped macros in the same argument
+                const input = '{{setvar::testvar::{{reverse}}ab{{/reverse}}-{{reverse}}cd{{/reverse}}}} {{getvar::testvar}}';
+                const output = await evaluateWithEngine(page, input);
+                expect(output).toBe(' ba-dc');
+            });
+
+            test('should resolve deeply nested scoped macros in arguments', async ({ page }) => {
+                // Scoped macro inside scoped macro inside argument
+                const input = '{{setvar::outer::{{setvar::inner::{{reverse}}xyz{{/reverse}}}}{{getvar::inner}}}} {{getvar::outer}}';
+                const output = await evaluateWithEngine(page, input);
+                expect(output).toBe(' zyx');
+            });
+
+            test('should resolve scoped macro with text before and after in argument', async ({ page }) => {
+                const input = '{{setvar::testvar::before {{reverse}}mid{{/reverse}} after}} {{getvar::testvar}}';
+                const output = await evaluateWithEngine(page, input);
+                expect(output).toBe(' before dim after');
+            });
+
+            test('should handle scoped macro inside first argument when macro has multiple args', async ({ page }) => {
+                // setvar has two args: name and value. Test scoped in value position.
+                const input = '{{setvar::myvar::prefix-{{reverse}}abc{{/reverse}}-suffix}}{{getvar::myvar}}';
+                const output = await evaluateWithEngine(page, input);
+                expect(output).toBe('prefix-cba-suffix');
+            });
+
+            test('should handle multiline scoped content inside argument', async ({ page }) => {
+                const input = '{{setvar::testvar::{{if true}}\ntrue\nbranch\n{{/if}}}} {{getvar::testvar}}';
+                const output = await evaluateWithEngine(page, input);
+                expect(output).toBe(' true\nbranch');
+            });
         });
     });
 
