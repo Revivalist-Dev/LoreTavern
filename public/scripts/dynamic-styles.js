@@ -17,7 +17,10 @@ const observer = new MutationObserver(mutations => {
                     try {
                         applyDynamicFocusStyles(node.sheet);
                     } catch (e) {
-                        console.warn('Failed to process new stylesheet:', e);
+                        // Suppress expected security errors from cross-origin injected styles
+                        if (e.name !== 'SecurityError') {
+                            console.warn('Failed to process new stylesheet:', e);
+                        }
                     }
                 });
             }
@@ -71,12 +74,14 @@ function applyDynamicFocusStyles(styleSheet, { fromExtension = false } = {}) {
                 // We collect all hover and focus rules to be able to later decide which hover rules don't have a matching focus rule
                 selectors.forEach(selector => {
                     const isHover = selector.includes(':hover'), isFocus = selector.includes(':focus');
+                    const isScrollbar = selector.includes('::-webkit-scrollbar'); // Check if it's a scrollbar selector
+
                     if (isHover && isFocus) {
                         // We currently do nothing here. Rules containing both hover and focus are very specific and should never be automatically touched
-                    } else if (isHover) {
+                    } else if (isHover && !isScrollbar) { // Ignore hover rules on scrollbars to prevent SyntaxErrors
                         const baseSelector = selector.replace(/:hover/g, PLACEHOLDER).trim();
                         hoverRules.push({ baseSelector, rule, wrappers: [...wrappers] });
-                    } else if (isFocus) {
+                    } else if (isFocus && !isScrollbar) { // Ignore focus rules on scrollbars to prevent SyntaxErrors
                         // We need to make sure that we remember all existing :focus, :focus-within and :focus-visible rules
                         const baseSelector = selector.replace(/:focus(-within|-visible)?/g, PLACEHOLDER).trim();
                         focusRules.add(`${baseSelector}|${wrapperSignature(wrappers)}`);
@@ -103,12 +108,31 @@ function applyDynamicFocusStyles(styleSheet, { fromExtension = false } = {}) {
      * @param {WrapperCond[]} wrappers - Wrapper conditions inherited from (at)import media
      */
     function processImportedStylesheet(sheet, wrappers = []) {
-        if (sheet && sheet.cssRules) {
-            processRules(sheet.cssRules, wrappers);
+        if (sheet) {
+            try {
+                if (sheet.cssRules) {
+                    processRules(sheet.cssRules, wrappers);
+                }
+            } catch (e) {
+                // Ignore SecurityError when trying to access cssRules of cross-origin imported stylesheets
+                if (e.name !== 'SecurityError') {
+                    console.warn('Failed to process imported stylesheet rules:', e);
+                }
+            }
         }
     }
 
-    processRules(styleSheet.cssRules, []);
+    try {
+        if (styleSheet.cssRules) {
+            processRules(styleSheet.cssRules, []);
+        }
+    } catch (e) {
+        // Stop execution for this sheet if cssRules cannot be accessed (SecurityError)
+        if (e.name !== 'SecurityError') {
+             console.warn('Failed to access rules on stylesheet:', e);
+        }
+        return; 
+    }
 
     /** @type {CSSStyleSheet} */
     let targetStyleSheet = null;
@@ -191,7 +215,10 @@ export function initDynamicStyles() {
         try {
             applyDynamicFocusStyles(sheet, { fromExtension: sheet.href?.toLowerCase().includes('scripts/extensions') == true });
         } catch (e) {
-            console.warn('Failed to process stylesheet on initial load:', e);
+            // Suppress expected security errors from cross-origin extensions
+            if (e.name !== 'SecurityError') {
+                 console.warn('Failed to process stylesheet on initial load:', e);
+            }
         }
     });
 }
