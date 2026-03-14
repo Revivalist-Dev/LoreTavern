@@ -79,6 +79,7 @@ import { t } from './i18n.js';
 import { ToolManager } from './tool-calling.js';
 import { accountStorage } from './util/AccountStorage.js';
 import { COMETAPI_IGNORE_PATTERNS, IGNORE_SYMBOL, MEDIA_DISPLAY, MEDIA_TYPE } from './constants.js';
+import { syncOpenRouterProvidersForModel, updateOpenRouterProvidersWarning } from './textgen-models.js';
 
 export {
     openai_messages_count,
@@ -2462,6 +2463,10 @@ function getReasoningEffort(settings = null, model = null) {
             case reasoning_effort_types.auto:
                 return undefined;
             case reasoning_effort_types.min:
+                if (chat_completion_sources.OPENROUTER === settings.chat_completion_source && !settings.show_thoughts) {
+                    return 'none';
+                }
+
                 return [chat_completion_sources.OPENAI, chat_completion_sources.AZURE_OPENAI].includes(settings.chat_completion_source) && /^gpt-5/.test(model)
                     ? reasoning_effort_types.min
                     : reasoning_effort_types.low;
@@ -2854,7 +2859,7 @@ export async function createGenerationParameters(settings, model, type, messages
         if (/gpt-5-chat-latest/.test(model)) {
             delete generate_data.tools;
             delete generate_data.tool_choice;
-        } else if (/gpt-5.(1|2)/.test(model) && !/chat-latest/.test(model)) {
+        } else if (/gpt-5\.(1|2|3|4)/.test(model) && !/chat-latest/.test(model)) {
             delete generate_data.frequency_penalty;
             delete generate_data.presence_penalty;
             delete generate_data.logit_bias;
@@ -4784,6 +4789,8 @@ function onSettingsPresetChange() {
 function getMaxContextOpenAI(value) {
     if (oai_settings.max_context_unlocked) {
         return unlocked_max;
+    } else if (value.startsWith('gpt-5.4')) {
+        return max_1mil;
     } else if (value.startsWith('gpt-5')) {
         return max_400k;
     } else if (value.includes('gpt-4.1')) {
@@ -5131,6 +5138,7 @@ async function onModelChange() {
 
         console.log('OpenRouter model changed to', value);
         oai_settings.openrouter_model = value;
+        syncOpenRouterProvidersForModel(value, '#openrouter_providers_chat');
     }
 
     if ($(this).is('#model_ai21_select')) {
@@ -6619,6 +6627,7 @@ export function initOpenAI() {
 
     $('#openrouter_allow_fallbacks').on('input', function () {
         oai_settings.openrouter_allow_fallbacks = !!$(this).prop('checked');
+        updateOpenRouterProvidersWarning('#openrouter_providers_chat');
         saveSettingsDebounced();
     });
 
@@ -6878,6 +6887,7 @@ export function initOpenAI() {
 
         oai_settings.openrouter_providers = selectedProviders;
 
+        updateOpenRouterProvidersWarning('#openrouter_providers_chat');
         saveSettingsDebounced();
     });
 
